@@ -9,6 +9,85 @@ def get_act_scale(x):
     return x.abs().view(-1, x.shape[-1]).mean(0)
 
 @torch.no_grad()
+def optimal_scales(block, linears2scale: list, x, kwargs={}, s_val=None):
+    x = x.to(next(block.parameters()).device)
+
+    # If fixed s_val, no need to search for it
+    if s_val is not None:
+        scales = torch.full((x.shape[-1],), 2, dtype=x.dtype, device=x.device)
+        return scales.view(-1).detach()
+
+    with torch.no_grad():
+        # If block is a list of layers, we need to process them sequentially
+        if isinstance(block, list):
+            org_out = x
+            for layer in block:
+                org_out = layer(org_out, **kwargs)
+                if isinstance(org_out, tuple):
+                    org_out = org_out[0]
+        else:
+            org_out = block(x, **kwargs)
+            if isinstance(org_out, tuple):
+                org_out = org_out[0]
+
+    # Gets average activations across calibration set
+    x_max = get_act_scale(x)
+
+    best_error = float("inf")
+    best_scales = None
+
+    # Grid search from 0 to 1 in intervals of 1 / n_grid
+    n_grid = 20
+
+    # Save original state
+    if isinstance(block, list):
+        original_states = []
+        for layer in block:
+            original_states.append({k: v.cpu() for k, v in layer.state_dict().items()})
+    else:
+        original_state = {k: v.cpu() for k, v in block.state_dict().items()}
+
+    for alpha in range(n_grid):
+        alpha = alpha * 1 / n_grid
+        scales = x_max.pow(alpha).clamp(min=1e-4).view(-1)
+        scales = scales / (scales.max() * scales.min()).sqrt()
+        
+        # Apply scales to all layers
+        for fc in linears2scale:
+            fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
+            fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+        
+        # Forward pass
+        if isinstance(block, list):
+            out = x
+            for layer in block:
+                out = layer(out, **kwargs)
+                if isinstance(out, tuple):
+                    out = out[0]
+        else:
+            out = block(x, **kwargs)
+            if isinstance(out, tuple):
+                out = out[0]
+
+        loss = (org_out - out).float().pow(2).mean().item()
+
+        # Find scales that lead to lowest loss
+        is_best = loss < best_error
+        if is_best:
+            best_error = loss
+            best_scales = scales
+        
+        # Restore original state
+        if isinstance(block, list):
+            for layer, state in zip(block, original_states):
+                layer.load_state_dict(state)
+        else:
+            block.load_state_dict(original_state)
+
+    best_scales = best_scales.view(-1)
+    return best_scales.detach()
+
+@torch.no_grad()
 def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_val=None):
     def w_quantize_func(p):
         return AWQCore.AWQQuantizer.quantize_tensor(
@@ -19,56 +98,6 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
 
     if "use_cache" in module_kwargs:
         module_kwargs.pop("use_cache")
-
-    def optimal_scales(block, linears2scale: list, x, kwargs={}, s_val=None):
-        x = x.to(next(block.parameters()).device)
-
-        # If fixed s_val, no need to search for it
-        if s_val is not None:
-            scales = torch.full((x.shape[-1],), 2, dtype=x.dtype, device=x.device)
-            return scales.view(-1).detach()
-
-        with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
-
-        # Gets average activations across calibration set
-        x_max = get_act_scale(x)
-
-        best_error = float("inf")
-        best_scales = None
-
-        # Grid search from 0 to 1 in intervals of 1 / n_grid
-        n_grid = 20
-
-        original_state = {k: v.cpu() for k, v in block.state_dict().items()}
-        for alpha in range(n_grid):
-            alpha = alpha * 1 / n_grid
-            scales = x_max.pow(alpha).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
-            for fc in linears2scale:
-                fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
-
-            loss = (
-                (org_out - out).float().pow(2).mean().item()
-            ) 
-
-            # Find scales that lead to lowest loss
-            is_best = loss < best_error
-            if is_best:
-                best_error = loss
-                best_scales = scales
-            
-            # Restore block for next iteration
-            block.load_state_dict(original_state)
-
-        best_scales = best_scales.view(-1)
-        return best_scales.detach()
 
     def get_scales(prev_op, layers, inp, inspect_module, kwargs={}, s_val=None):
         scales = optimal_scales(inspect_module, layers, inp, kwargs, s_val)
@@ -101,7 +130,7 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
                 prev_op=getattr(module, f"{attn_module_name}_layer_norm"),
                 layers=[m for _, m in attn_layers],
                 inp=attn_input_feat,
-                inspect_module=attn_module,
+                inspect_module=attn_layers,  # Pass the list of layers
                 kwargs=module_kwargs,
                 s_val=s_val
             )
