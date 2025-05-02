@@ -81,47 +81,83 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
 
     scales_list = []
 
-    scales_list.append(
-        get_scales(
-            prev_op=module.self_attn_layer_norm,
-            layers=[
-                module.self_attn.q_proj,
-                module.self_attn.k_proj,
-                module.self_attn.v_proj,
-            ],
-            inp=input_feat["self_attn.q_proj"],
-            inspect_module=module.self_attn,
-            kwargs=module_kwargs,
-            s_val=s_val
+    # Find attention layers dynamically
+    attn_layers = []
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Linear) and any(x in name.lower() for x in ['q_proj', 'k_proj', 'v_proj']):
+            attn_layers.append((name, m))
+    
+    if attn_layers:
+        # Get the first attention layer's name to find the attention module
+        first_attn_name = attn_layers[0][0]
+        attn_module_name = first_attn_name.split('.')[0]
+        attn_module = getattr(module, attn_module_name)
+        
+        # Get input features for attention
+        attn_input_feat = next(iter(input_feat.values()))
+        
+        scales_list.append(
+            get_scales(
+                prev_op=getattr(module, f"{attn_module_name}_layer_norm"),
+                layers=[m for _, m in attn_layers],
+                inp=attn_input_feat,
+                inspect_module=attn_module,
+                kwargs=module_kwargs,
+                s_val=s_val
+            )
         )
-    )
-    scales_list.append(
-        get_scales(
-            prev_op=module.self_attn.v_proj,
-            layers=[module.self_attn.out_proj],
-            inp=input_feat["self_attn.out_proj"],
-            inspect_module=module.self_attn.out_proj,
-            s_val=s_val
+
+    # Find output projection layer
+    out_proj = None
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Linear) and 'out_proj' in name.lower():
+            out_proj = (name, m)
+            break
+    
+    if out_proj:
+        out_proj_name, out_proj_layer = out_proj
+        out_proj_input_feat = next(iter(input_feat.values()))
+        
+        scales_list.append(
+            get_scales(
+                prev_op=out_proj_layer,
+                layers=[out_proj_layer],
+                inp=out_proj_input_feat,
+                inspect_module=out_proj_layer,
+                s_val=s_val
+            )
         )
-    )
-    scales_list.append(
-        get_scales(
-            prev_op=module.final_layer_norm,
-            layers=[module.fc1],
-            inp=input_feat["fc1"],
-            inspect_module=module.fc1,
-            s_val=s_val
+
+    # Find feed-forward layers
+    ff_layers = []
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Linear) and any(x in name.lower() for x in ['fc1', 'fc2']):
+            ff_layers.append((name, m))
+    
+    if len(ff_layers) >= 2:
+        fc1_name, fc1 = ff_layers[0]
+        fc2_name, fc2 = ff_layers[1]
+        fc1_input_feat = next(iter(input_feat.values()))
+        
+        scales_list.append(
+            get_scales(
+                prev_op=getattr(module, "final_layer_norm"),
+                layers=[fc1],
+                inp=fc1_input_feat,
+                inspect_module=fc1,
+                s_val=s_val
+            )
         )
-    )
-    scales_list.append(
-        get_scales(
-            prev_op=module.fc1,
-            layers=[module.fc2],
-            inp=input_feat["fc2"],
-            inspect_module=module.fc2,
-            s_val=s_val
+        
+        scales_list.append(
+            get_scales(
+                prev_op=fc1,
+                layers=[fc2],
+                inp=fc1_input_feat,
+                inspect_module=fc2,
+                s_val=s_val
+            )
         )
-    )   
     
     gc.collect()
     torch.cuda.empty_cache()
