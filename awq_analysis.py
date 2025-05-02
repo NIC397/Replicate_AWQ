@@ -7,7 +7,8 @@ import gc
 from datasets import load_dataset
 from typing import Dict, List, Tuple, Optional, Union
 from awq_core import AWQCore
-from awq_optimization import AWQOptimizer
+from awq_scale import auto_scale_block, apply_scale
+from awq_clip import auto_clip_block, apply_clip
 
 class AWQAnalyzer:
     """AWQ analysis class that combines calibration and salient weight finding functionality.
@@ -193,28 +194,31 @@ class AWQAnalyzer:
                 gc.collect()
                 torch.cuda.empty_cache()
                 
-                # Create optimizer for this layer
-                optimizer = AWQOptimizer(
+                # Get scale and clip results directly
+                scale_results = auto_scale_block(
                     layer,
+                    module_kwargs=layer_kwargs,
                     num_bits=num_bits,
-                    group_size=group_size
+                    group_size=group_size,
+                    input_feat=input_feat,
+                    s_val=s_val
                 )
                 
-                # Get optimization results
-                results = optimizer.optimize(
-                    input_feat=input_feat,
-                    module_kwargs=layer_kwargs,
-                    s_val=s_val
+                clip_results = auto_clip_block(
+                    layer,
+                    num_bits=num_bits,
+                    group_size=group_size,
+                    input_feat=input_feat
                 )
                 
                 # Update results
                 s_and_salient_weights["scale"] += AWQCore.AWQUtils.append_str_prefix(
-                    results["scale"],
+                    scale_results,
                     AWQCore.AWQUtils.get_op_name(model, layer) + "."
                 )
                 
                 s_and_salient_weights["clip"] += AWQCore.AWQUtils.append_str_prefix(
-                    results["clip"],
+                    clip_results,
                     AWQCore.AWQUtils.get_op_name(model, layer) + "."
                 )
                 
@@ -222,7 +226,8 @@ class AWQAnalyzer:
                 layer = layer.cpu()
                 del layer
                 del input_feat
-                del results
+                del scale_results
+                del clip_results
                 del named_linears
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -251,8 +256,6 @@ class AWQAnalyzer:
         self.num_bits = num_bits
         self.group_size = group_size
         self.device = device
-        self.calibration_manager = AWQAnalyzer.CalibrationManager()
-        self.salient_finder = AWQAnalyzer.SalientWeightFinder()
     
     def analyze(
         self,
@@ -272,13 +275,13 @@ class AWQAnalyzer:
         Returns:
             Dictionary containing scaling and clipping information
         """
-        return self.salient_finder.find_salient_weights(
+        return AWQAnalyzer.SalientWeightFinder.find_salient_weights(
             self.model,
             self.tokenizer,
             self.group_size,
-            s_val,
-            self.num_bits,
-            n_samples,
-            seqlen,
-            calib_data
+            s_val=s_val,
+            num_bits=self.num_bits,
+            n_samples=n_samples,
+            seqlen=seqlen,
+            calib_data=calib_data
         ) 
