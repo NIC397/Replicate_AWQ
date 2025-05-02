@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import gc
 from awq_core import AWQLinear
+from tqdm import tqdm
 
 def get_blocks(model):
     return model.model.decoder.layers
