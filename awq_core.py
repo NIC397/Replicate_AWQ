@@ -3,6 +3,7 @@ from torch import nn
 import gc
 from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
+from typing import Any
 
 class AWQCore:
     """Core AWQ (Activation-aware Weight Quantization) implementation.
