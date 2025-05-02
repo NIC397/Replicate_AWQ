@@ -10,7 +10,12 @@ def get_act_scale(x):
 
 @torch.no_grad()
 def optimal_scales(block, linears2scale: list, x, kwargs={}, s_val=None):
-    x = x.to(next(block.parameters()).device)
+    # Handle device transfer based on whether block is a single layer or list
+    if isinstance(block, list):
+        # For list of layers, use the first layer's device
+        x = x.to(next(block[0].parameters()).device)
+    else:
+        x = x.to(next(block.parameters()).device)
 
     # If fixed s_val, no need to search for it
     if s_val is not None:
