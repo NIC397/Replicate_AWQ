@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import gc
-from awq_core import AWQLinear
+from awq_core import QuantizedLinearLayer
 from tqdm import tqdm
 
 def get_blocks(model):
@@ -71,7 +71,7 @@ def quantize(model, num_bits, group_size):
             module.weight.data, scales, zeros = quantize_tensor(
                 module.weight.data, num_bits=num_bits, group_size=group_size, get_scale_zp=True
             )
-            q_linear = AWQLinear.from_linear(
+            q_linear = QuantizedLinearLayer.from_dense_layer(
                 module, num_bits, group_size, scales, zeros
             )
             module.cpu()
