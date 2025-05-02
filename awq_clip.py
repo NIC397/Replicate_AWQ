@@ -1,8 +1,7 @@
 import torch
 from torch import nn
 import gc
-from helpers import get_op_by_name
-from quant import quantize_tensor
+from awq_core import AWQCore
 
 # weight quantization
 @torch.no_grad()
@@ -32,7 +31,7 @@ def auto_clip_layer(
             max_val = org_max_val * (1 - i_s / n_grid)
             min_val = -max_val
             cur_w = torch.clamp(w, min_val, max_val)
-            q_w = quantize_tensor(cur_w, num_bits=num_bits, group_size=group_size)
+            q_w = AWQCore.AWQQuantizer.quantize_tensor(cur_w, num_bits=num_bits, group_size=group_size)
             cur_out = (input_feat * q_w).sum(dim=-1)
 
             err = (cur_out - org_out).pow(2).mean(dim=1).view(min_errs.shape)
@@ -73,7 +72,7 @@ def auto_clip_block(module, num_bits, group_size, input_feat):
 @torch.no_grad()
 def apply_clip(module, clip_list):
     for name, max_val in clip_list:
-        layer = get_op_by_name(module, name)
+        layer = AWQCore.AWQUtils.get_op_by_name(module, name)
         layer.cuda()
         max_val = max_val.to(layer.weight.device)
         org_shape = layer.weight.shape

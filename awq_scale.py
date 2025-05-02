@@ -1,8 +1,7 @@
 import torch
 from torch import nn
 import gc
-from helpers import get_op_name, get_op_by_name
-from quant import quantize_tensor
+from awq_core import AWQCore
 from awq_clip import apply_clip
 
 @torch.no_grad()
@@ -12,7 +11,7 @@ def get_act_scale(x):
 @torch.no_grad()
 def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_val=None):
     def w_quantize_func(p):
-        return quantize_tensor(
+        return AWQCore.AWQQuantizer.quantize_tensor(
             p,
             num_bits=num_bits,
             group_size=group_size,
@@ -75,8 +74,8 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
         scales = optimal_scales(inspect_module, layers, inp, kwargs, s_val)
         scales = scales.detach().cpu()
         return (
-            get_op_name(module, prev_op),
-            tuple([get_op_name(module, m) for m in layers]),
+            AWQCore.AWQUtils.get_op_name(module, prev_op),
+            tuple([AWQCore.AWQUtils.get_op_name(module, m) for m in layers]),
             scales,
         )
 
@@ -135,8 +134,8 @@ def apply_awq_scaling(model, awq_results):
 
 def apply_scale(module, scales_list, input_feat_dict=None):
     for prev_op_name, layer_names, scales in scales_list:
-        prev_op = get_op_by_name(module, prev_op_name)
-        layers = [get_op_by_name(module, name) for name in layer_names]
+        prev_op = AWQCore.AWQUtils.get_op_by_name(module, prev_op_name)
+        layers = [AWQCore.AWQUtils.get_op_by_name(module, name) for name in layer_names]
         prev_op.cuda()
         for layer in layers:
             layer.cuda()
