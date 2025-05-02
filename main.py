@@ -2,7 +2,8 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from awq_core import AWQCore
-from awq_optimization import AWQOptimizer
+from awq_scale import auto_scale_block, apply_scale
+from awq_clip import auto_clip_block, apply_clip
 from awq_analysis import AWQAnalyzer
 from awq_evaluation import AWQEvaluator
 import logging
@@ -101,20 +102,39 @@ def process_model(
         calib_data=calib_data
     )
     
-    # Create optimizer
-    optimizer = AWQOptimizer(
-        model,
-        num_bits=num_bits,
-        group_size=group_size,
-        device=device
-    )
+    # Apply scaling and clipping
+    logging.info("Applying scaling and clipping")
+    scale_results = []
+    clip_results = []
     
-    # Optimize model
-    logging.info("Optimizing model")
-    optimization_results = optimizer.optimize(
-        input_feat=s_and_salient_weights,
-        s_val=s_val
-    )
+    for block in AWQCore.AWQUtils.get_blocks(model):
+        # Apply scaling
+        scale_results.append(
+            auto_scale_block(
+                block,
+                module_kwargs={},
+                num_bits=num_bits,
+                group_size=group_size,
+                input_feat=s_and_salient_weights,
+                s_val=s_val
+            )
+        )
+        
+        # Apply clipping
+        clip_results.append(
+            auto_clip_block(
+                block,
+                num_bits=num_bits,
+                group_size=group_size,
+                input_feat=s_and_salient_weights
+            )
+        )
+    
+    # Combine results
+    optimization_results = {
+        "scale": scale_results,
+        "clip": clip_results
+    }
     
     # Create evaluator
     evaluator = AWQEvaluator(
