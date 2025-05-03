@@ -2,18 +2,16 @@ import torch
 from torch import nn
 import gc
 from awq_utils import get_op_name, get_op_by_name
-from awq_utils import quantize_tensor
-
+from awq_utils import quantize_weight
+import copy
 @torch.no_grad()
 def get_act_scale(x):
     return x.abs().view(-1, x.shape[-1]).mean(0)
 
 @torch.no_grad()
 def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_val=None):
-    # TODO - complete
-
     def w_quantize_func(p):
-        return quantize_tensor(
+        return quantize_weight(
             p,
             num_bits=num_bits,
             group_size=group_size,
@@ -22,56 +20,173 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
     if "use_cache" in module_kwargs:
         module_kwargs.pop("use_cache")
 
-    def optimal_scales(block, linears2scale: list, x, kwargs={}, s_val=None):
-        # TODO - complete
+    def optimal_scales(block, linears2scale: list, x, kwargs={},s_val=None):
+        # w: co, ci
+        # x: n, ci
         x = x.to(next(block.parameters()).device)
-
-        # If fixed s_val, no need to search for it
         if s_val is not None:
             scales = torch.full((x.shape[-1],), 2, dtype=x.dtype, device=x.device)
             return scales.view(-1).detach()
-
         with torch.no_grad():
             org_out = block(x, **kwargs)
             if isinstance(org_out, tuple):
                 org_out = org_out[0]
 
-        # Gets average activations across calibration set
         x_max = get_act_scale(x)
 
         best_error = float("inf")
+        best_ratio = -1
         best_scales = None
 
-        # Grid search from 0 to 1 in intervals of 1 / n_grid
         n_grid = 20
+        history = []
 
-        original_state = {k: v.cpu() for k, v in block.state_dict().items()}
-        for alpha in range(n_grid):
-            alpha = alpha * 1 / n_grid
-            scales = x_max.pow(alpha).clamp(min=1e-4).view(-1)
+        org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
+        for ratio in range(n_grid):
+            ratio = ratio * 1 / n_grid
+            scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
             scales = scales / (scales.max() * scales.min()).sqrt()
             for fc in linears2scale:
                 fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
                 fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+            print("memory after applying scales: ", torch.cuda.memory_allocated()/1024**2)
             out = block(x, **kwargs)
+            print("memory after forward pass: ", torch.cuda.memory_allocated()/1024**2)
             if isinstance(out, tuple):
                 out = out[0]
 
             loss = (
                 (org_out - out).float().pow(2).mean().item()
-            ) 
-
-            # Find scales that lead to lowest loss
+            )  # float prevents overflow
+            history.append(loss)
             is_best = loss < best_error
             if is_best:
                 best_error = loss
+                best_ratio = ratio
                 best_scales = scales
-            
-            # Restore block for next iteration
-            block.load_state_dict(original_state)
-
+            block.load_state_dict(org_sd)
+        if best_ratio == -1:
+            print(history)
+            raise Exception
+        # print(best_ratio)
         best_scales = best_scales.view(-1)
+
+        assert torch.isnan(best_scales).sum() == 0, best_scales
         return best_scales.detach()
+
+    # def optimal_scales(block, linears2scale: list, x, kwargs={}, s_val=None):
+    #     x = x.to(next(block.parameters()).device)
+
+    #     # If fixed s_val, no need to search for it
+    #     if s_val is not None:
+    #         scales = torch.full((x.shape[-1],), 2, dtype=x.dtype, device=x.device)
+    #         return scales.view(-1).detach()
+
+    #     # with torch.no_grad():
+    #     #     org_out = block(x, **kwargs)
+    #     #     if isinstance(org_out, tuple):
+    #     #         org_out = org_out[0]
+
+    #     with torch.no_grad():
+    #         org_out = block(x, **kwargs)
+    #         if isinstance(org_out, tuple):
+    #             org_out = org_out[0].clone()  
+    #         else:
+    #             org_out = org_out.clone()
+
+    #     # Gets average activations across calibration set
+    #     x_max = get_act_scale(x)
+
+    #     best_error = float("inf")
+    #     best_scales = None
+    #     best_ratio = -1
+
+    #     # Grid search from 0 to 1 in intervals of 1 / n_grid
+    #     n_grid = 20
+
+    #     # Save original state to CPU
+    #     original_state = {k: v.cpu() for k, v in block.state_dict().items()}
+    #     print(f"Memory after saving original state: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    #     for alpha in range(n_grid):
+    #         gc.collect()
+    #         torch.cuda.empty_cache()
+    #         alpha = alpha * 1 / n_grid
+    #         scales = x_max.pow(alpha).clamp(min=1e-4).view(-1)
+    #         scales = scales / (scales.max() * scales.min()).sqrt()
+
+    #         # # Apply scales to weights
+    #         # for fc in linears2scale:
+    #         #     fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
+    #         #     fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+    #         # print(f"Memory after applying scales: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    #         # # out = block(x, **kwargs)
+    #         # # if isinstance(out, tuple):
+    #         # #     out = out[0]
+    #         # with torch.no_grad():
+    #         #     out = block(x, **kwargs)
+    #         #     if isinstance(out, tuple):
+    #         #         out = out[0]
+    #         #     loss = (org_out - out).float().pow(2).mean().item()
+
+
+    #         block_copy = copy.deepcopy(block).to(x.device)
+    #         block_copy.load_state_dict(original_state)
+
+    #         # # apply scales
+    #         # for fc in linears2scale:
+    #         #     fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
+    #         #     fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+
+    #         for original_fc in linears2scale:
+    #             fc_name = get_op_name(block, original_fc)
+    #             fc_copy = get_op_by_name(block_copy, fc_name)
+
+    #             scales_tensor = scales.view(1, -1).to(fc_copy.weight.device)
+
+    #             fc_copy.weight.data = fc_copy.weight.data * scales_tensor
+    #             fc_copy.weight.data = w_quantize_func(fc_copy.weight.data) / scales_tensor
+
+    #         with torch.no_grad():
+    #             out = block_copy(x, **kwargs)
+    #             if isinstance(out, tuple):
+    #                 out = out[0]
+    #             loss = (org_out - out).float().pow(2).mean().item()
+    #             is_best = loss < best_error
+    #             if is_best:
+    #                 best_error = loss
+    #                 best_ratio = alpha
+    #                 best_scales = scales.clone().cpu()
+
+    #         del block_copy, out, loss
+    #         gc.collect()
+    #         torch.cuda.empty_cache()
+    #         print(f"Memory after forward pass: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    #         # loss = (org_out - out).float().pow(2).mean().item()
+    #         # history.append(loss)
+    #         # print(f"Memory after loss: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    #         # Find scales that lead to lowest loss
+        
+            
+    #         # Restore block for next iteration
+    #         # block.load_state_dict(original_state)
+    #         print(f"Memory after restoring block: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    #         # Clear intermediate tensors
+          
+    #         del scales
+    #         gc.collect()
+    #         torch.cuda.empty_cache()
+    #         print(f"Memory after clearing intermediate tensors: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    #     if best_ratio == -1:
+    #         raise Exception("No valid scales found")
+
+    #     # Clear memory before returning
+    #     del org_out
+    #     del x_max
+    #     del x
+    #     gc.collect()
+    #     torch.cuda.empty_cache()
+    #     best_scales = best_scales.view(-1)
+    #     return best_scales.detach()
 
     def get_scales(prev_op, layers, inp, inspect_module, kwargs={}, s_val=None):
         # TODO - complete
@@ -99,6 +214,7 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
             s_val=s_val
         )
     )
+    print(f"Memory after self_attn: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
     scales_list.append(
         get_scales(
             prev_op=module.self_attn.v_proj,
@@ -117,6 +233,7 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
             s_val=s_val
         )
     )
+
     scales_list.append(
         get_scales(
             prev_op=module.fc1,
@@ -126,7 +243,7 @@ def auto_scale_block(module, module_kwargs, num_bits, group_size, input_feat, s_
             s_val=s_val
         )
     )   
-    
+
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -137,23 +254,53 @@ def apply_awq_scaling(model, awq_results):
     apply_scale(model, awq_results["scale"])
     apply_clip(model, awq_results["clip"])
 
+# def apply_scale(module, scales_list, input_feat_dict=None):
+#     for prev_op_name, layer_names, scales in scales_list:
+#         prev_op = get_op_by_name(module, prev_op_name)
+#         layers = [get_op_by_name(module, name) for name in layer_names]
+#         prev_op.cuda()
+#         for layer in layers:
+#             layer.cuda()
+#         scales.cuda()
+#         if isinstance(prev_op, nn.Linear):
+#             scale_fc_fc(prev_op, layers[0], scales)
+#         elif isinstance(prev_op, nn.LayerNorm):
+#             scale_ln_fcs(prev_op, layers, scales)
+
+#         if input_feat_dict is not None:
+#             for layer_name in layer_names:
+#                 inp = input_feat_dict[layer_name]
+#                 inp.div_(scales.view(1, -1).to(inp.device))
+
+
 def apply_scale(module, scales_list, input_feat_dict=None):
     for prev_op_name, layer_names, scales in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
+
         prev_op.cuda()
         for layer in layers:
             layer.cuda()
         scales.cuda()
-        if isinstance(prev_op, nn.Linear):
-            scale_fc_fc(prev_op, layers[0], scales)
-        elif isinstance(prev_op, nn.LayerNorm):
-            scale_ln_fcs(prev_op, layers, scales)
 
+        if isinstance(prev_op, nn.Linear):
+            assert len(layers) == 1
+            scale_fc_fc(prev_op, layers[0], scales)
+        elif isinstance(prev_op, (nn.LayerNorm,)):
+            scale_ln_fcs(prev_op, layers, scales)
+        else:
+            raise NotImplementedError(f"prev_op {type(prev_op)} not supported yet!")
+
+        # apply the scaling to input feat if given; prepare it for clipping
         if input_feat_dict is not None:
             for layer_name in layer_names:
                 inp = input_feat_dict[layer_name]
-                inp.div_(scales.view(1, -1).to(inp.device))
+                inp.div_(scales.view(1, -1).to(inp.device).to(inp.dtype))
+
+        prev_op.cpu()
+        for layer in layers:
+            layer.cpu()
+        scales.cpu()
 
 @torch.no_grad()
 def scale_fc_fc(fc1, fc2, scales):
@@ -209,7 +356,7 @@ def auto_clip_layer(
             max_val = org_max_val * (1 - i_s / n_grid)
             min_val = -max_val
             cur_w = torch.clamp(w, min_val, max_val)
-            q_w = quantize_tensor(cur_w, num_bits=num_bits, group_size=group_size)
+            q_w = quantize_weight(cur_w, num_bits=num_bits, group_size=group_size)
             cur_out = (input_feat * q_w).sum(dim=-1)
 
             err = (cur_out - org_out).pow(2).mean(dim=1).view(min_errs.shape)

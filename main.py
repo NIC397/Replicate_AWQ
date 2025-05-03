@@ -17,12 +17,8 @@ args = parser.parse_args()
 if args.test:
     models = ["opt-125m"]
 else:
-    models = ["opt-1.3b", "opt-2.7b", "opt-6.7b"]
+    models = ["opt-1.3b", "opt-2.7b", "opt-6.7b", "opt-13b"]
 
-    # Exceeds L4 GPU RAM when scaling and quantizing
-    # models.append("opt-13b")
-    # Exceeds A100 GPU RAM and L4 GPU RAM when scaling and quantizing
-    # models.append("opt-30b")
 
 group_size = 128
 kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
@@ -37,7 +33,7 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
         model_path = "facebook/" + model_name
-        print("Working on " + model_name + "...")
+        print("Performing AWQ on " + model_name + "...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         enc = AutoTokenizer.from_pretrained(
                         model_path, use_fast=False, trust_remote_code=True

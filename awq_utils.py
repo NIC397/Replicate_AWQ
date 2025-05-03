@@ -1,11 +1,9 @@
 import torch
 from torch import nn
+from tqdm import tqdm
 import gc
 from awq_core import QuantizedLinearLayer
-from tqdm import tqdm
 
-def get_blocks(model):
-    return model.model.decoder.layers
 
 def move_device(model, device_type):
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(device_type)
@@ -14,6 +12,9 @@ def move_device(model, device_type):
     )
     gc.collect()
     torch.cuda.empty_cache()
+
+def get_blocks(model):
+    return model.model.decoder.layers
 
 def append_str_prefix(x, prefix):
     if isinstance(x, str):
@@ -68,7 +69,7 @@ def quantize(model, num_bits, group_size):
 
         for name, module in named_linears.items():
             module.cuda()
-            module.weight.data, scales, zeros = quantize_tensor(
+            module.weight.data, scales, zeros = quantize_weight(
                 module.weight.data, num_bits=num_bits, group_size=group_size, get_scale_zp=True
             )
             q_linear = QuantizedLinearLayer.from_dense_layer(
@@ -83,24 +84,25 @@ def quantize(model, num_bits, group_size):
     torch.cuda.empty_cache()
     gc.collect()
 
-def quantize_tensor(
-    w, num_bits, group_size, get_scale_zp=False
-):
-    original_w_shape = w.shape
+def quantize_weight(w, num_bits, group_size, get_scale_zp=False):
+    org_w_shape = w.shape
 
     w = w.reshape(-1, group_size)
     max_val = w.amax(dim=1, keepdim=True)
     min_val = w.amin(dim=1, keepdim=True)
     max_int = 2**num_bits - 1
     min_int = 0
+ 
     scales = (max_val - min_val).clamp(min=1e-5) / max_int
     zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+    assert torch.isnan(scales).sum() == 0
+    assert torch.isnan(w).sum() == 0
 
     w = (
         torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
     ) * scales
 
-    w = w.reshape(original_w_shape)
+    w = w.reshape(org_w_shape)
 
     if get_scale_zp:
         return w, scales.view(w.shape[0], -1), zeros.view(w.shape[0], -1)

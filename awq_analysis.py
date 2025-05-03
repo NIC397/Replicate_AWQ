@@ -20,9 +20,7 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
     layers = get_blocks(model)
 
     calib_data="pileval"
-    samples = get_calib_dataset(
-        data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen
-    )
+    samples = get_calib_dataset(data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen)
     samples = torch.cat(samples, dim=0)
 
     inps = []
@@ -31,7 +29,6 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
     layers[0] = layers[0].cuda()
     move_device(model, "cuda")
 
-    # Hack to get input and kwargs - taken from official AWQ Repo
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -50,6 +47,7 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
 
     # Can get rid of sample - just need activations in model
     del samples
+    torch.cuda.empty_cache()
 
     layers[0] = layers[0].module
     inps = inps[0]
@@ -58,20 +56,29 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
     move_device(model, "cpu")
 
     gc.collect()
+    torch.cuda.empty_cache()
 
     s_and_salient_weights = {
         "scale": [],
         "clip": [],
     }
-    torch.cuda.empty_cache()
 
+    print(f"Initial GPU memory: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+    
     for i in tqdm(range(len(layers)), desc="Running AWQ..."):
+        print(f"\nProcessing layer {i}:")
+        print(f"Before layer processing: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+        
         # Clear GPU Memory
         gc.collect()
         torch.cuda.empty_cache()
+        
         layer = layers[i]
         layer = layer.cuda()
+        print(f"After moving layer to GPU: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+        
         named_linears = get_named_linears(layer)
+        print(f"After getting named linears: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
         def cache_input_hook(m, x, y, name, feat_dict):
             x = x[0]
@@ -86,16 +93,31 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
                     functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
+        
         inps = layer(inps, **layer_kwargs)[0]
+        # print(f"After forward pass: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+        
+        # Remove hooks and clear handles
         for h in handles:
             h.remove()
         del handles
-
-        input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
-
-        # Clear GPU memory
         gc.collect()
         torch.cuda.empty_cache()
+        # print(f"After removing hooks: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+
+        # Convert input features to tensors
+        input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+        # print(f"After converting input features: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+
+        # Clear GPU memory before auto_scale_block
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # # Move input features to CPU temporarily
+        # input_feat_cpu = {k: v.cpu() for k, v in input_feat.items()}
+        # del input_feat
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
         scales_list = auto_scale_block(
             layer,
@@ -105,8 +127,16 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
             input_feat=input_feat,
             s_val=s_val
         )
+        print(len(scales_list))
+        print(scales_list)
+
+        # input_feat = {k: v.cuda() for k, v in input_feat_cpu.items()}
+        # del input_feat_cpu
+        # gc.collect()
+        torch.cuda.empty_cache()
 
         apply_scale(layers[i], scales_list, input_feat_dict=input_feat)
+        print(f"After apply_scale: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
         s_and_salient_weights["scale"] += append_str_prefix(
             scales_list, get_op_name(model, layer) + "."
@@ -116,22 +146,27 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
         del scales_list
         gc.collect()
         torch.cuda.empty_cache()
+        # print(f"After clearing scales: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
-        # Apply weight clipping to reduce MSE
-        # Reduces quantization error in delta
+        # Apply weight clipping
         clip_list = auto_clip_block(
             layer,
             num_bits=num_bits,
             group_size=group_size,
             input_feat=input_feat,
         )
+        # print(f"After auto_clip_block: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
+
         apply_clip(layer, clip_list)
+        # print(f"After apply_clip: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
         s_and_salient_weights["clip"] += append_str_prefix(
             clip_list, get_op_name(model, layer) + "."
         )
 
+        # Move layer back to CPU
         layer = layer.cpu()
+        # print(f"After moving layer to CPU: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
         # Clear GPU Memory
         del layer
@@ -140,6 +175,7 @@ def find_s_and_salient_weights(model, enc, group_size, s_val=None):
         del named_linears
         gc.collect()
         torch.cuda.empty_cache()
+        # print(f"After final cleanup: {torch.cuda.memory_allocated()/1024**2:.2f}MB")
 
     return s_and_salient_weights
 

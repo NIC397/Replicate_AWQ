@@ -172,3 +172,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+opt-6.7b_s2.pt
+opt-13b_s2.pt
